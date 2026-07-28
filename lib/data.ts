@@ -2,26 +2,68 @@ import { env } from "cloudflare:workers";
 
 type D1Env = { DB: D1Database };
 
+export type Organization = {
+  id: number;
+  corpId: string;
+  name: string;
+};
+
+let schemaPromise: Promise<void> | null = null;
+
 function db() {
-  const binding = (env as unknown as D1Env).DB;
-  if (!binding) throw new Error("D1 数据库尚未绑定");
-  return binding;
+  const database = (env as unknown as D1Env).DB;
+  if (!database) throw new Error("D1 数据库尚未绑定");
+  return database;
 }
 
 const schemaStatements = [
+  `CREATE TABLE IF NOT EXISTS organizations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    corp_id TEXT NOT NULL UNIQUE,
+    name TEXT NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
+  `CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    dingtalk_user_id TEXT NOT NULL,
+    union_id TEXT,
+    name TEXT NOT NULL,
+    avatar TEXT,
+    department_ids TEXT NOT NULL DEFAULT '[]',
+    role TEXT NOT NULL DEFAULT 'member',
+    active INTEGER NOT NULL DEFAULT 1,
+    last_login_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id, dingtalk_user_id)
+  )`,
+  `CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    user_id INTEGER NOT NULL REFERENCES users(id),
+    expires_at TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`,
   `CREATE TABLE IF NOT EXISTS sample_orders (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    order_no TEXT NOT NULL UNIQUE,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
+    order_no TEXT NOT NULL,
     customer TEXT NOT NULL,
     merchandiser TEXT NOT NULL,
     due_date TEXT NOT NULL,
     priority TEXT NOT NULL DEFAULT '普通',
     sample_type TEXT NOT NULL DEFAULT '开发样',
     status TEXT NOT NULL DEFAULT '待审单',
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id, order_no)
   )`,
   `CREATE TABLE IF NOT EXISTS styles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
     order_id INTEGER NOT NULL REFERENCES sample_orders(id),
     style_no TEXT NOT NULL,
     color TEXT NOT NULL,
@@ -34,10 +76,12 @@ const schemaStatements = [
   )`,
   `CREATE TABLE IF NOT EXISTS process_tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
     style_id INTEGER NOT NULL REFERENCES styles(id),
     process TEXT NOT NULL,
     sequence INTEGER NOT NULL,
     assignee TEXT NOT NULL,
+    assignee_user_id INTEGER REFERENCES users(id),
     status TEXT NOT NULL,
     planned_start TEXT,
     planned_end TEXT,
@@ -50,6 +94,7 @@ const schemaStatements = [
   )`,
   `CREATE TABLE IF NOT EXISTS change_records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
     style_id INTEGER NOT NULL REFERENCES styles(id),
     from_version INTEGER NOT NULL,
     to_version INTEGER NOT NULL,
@@ -61,6 +106,7 @@ const schemaStatements = [
   )`,
   `CREATE TABLE IF NOT EXISTS notifications (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
     recipient TEXT NOT NULL,
     title TEXT NOT NULL,
     body TEXT NOT NULL,
@@ -70,88 +116,108 @@ const schemaStatements = [
   )`,
   `CREATE TABLE IF NOT EXISTS audit_logs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
     entity_type TEXT NOT NULL,
     entity_id INTEGER NOT NULL,
     action TEXT NOT NULL,
     before_value TEXT,
     after_value TEXT,
     actor TEXT NOT NULL,
-    idempotency_key TEXT UNIQUE,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    actor_user_id INTEGER REFERENCES users(id),
+    idempotency_key TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(org_id, idempotency_key)
   )`,
   `CREATE TABLE IF NOT EXISTS attachments (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    org_id INTEGER NOT NULL REFERENCES organizations(id),
     style_id INTEGER NOT NULL REFERENCES styles(id),
     version INTEGER NOT NULL,
     object_key TEXT NOT NULL,
     file_name TEXT NOT NULL,
     content_type TEXT NOT NULL,
     uploaded_by TEXT NOT NULL,
+    uploaded_by_user_id INTEGER REFERENCES users(id),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   )`,
-  "CREATE INDEX IF NOT EXISTS process_tasks_style_idx ON process_tasks(style_id)",
-  "CREATE INDEX IF NOT EXISTS styles_order_idx ON styles(order_id)",
-  "CREATE INDEX IF NOT EXISTS notifications_status_idx ON notifications(status)",
 ];
 
-export async function ensureDatabase() {
-  const binding = db();
-  await binding.batch(schemaStatements.map((statement) => binding.prepare(statement)));
-  const count = await binding.prepare("SELECT COUNT(*) AS count FROM sample_orders").first<{ count: number }>();
-  if ((count?.count ?? 0) > 0) return;
+const indexes = [
+  "CREATE INDEX IF NOT EXISTS users_org_idx ON users(org_id, active)",
+  "CREATE INDEX IF NOT EXISTS sessions_expiry_idx ON sessions(expires_at)",
+  "CREATE INDEX IF NOT EXISTS orders_org_due_idx ON sample_orders(org_id, due_date)",
+  "CREATE INDEX IF NOT EXISTS styles_org_order_idx ON styles(org_id, order_id)",
+  "CREATE INDEX IF NOT EXISTS tasks_org_style_idx ON process_tasks(org_id, style_id)",
+  "CREATE INDEX IF NOT EXISTS tasks_org_assignee_idx ON process_tasks(org_id, assignee_user_id, status)",
+  "CREATE INDEX IF NOT EXISTS changes_org_style_idx ON change_records(org_id, style_id)",
+  "CREATE INDEX IF NOT EXISTS notifications_org_status_idx ON notifications(org_id, status)",
+  "CREATE INDEX IF NOT EXISTS audits_org_created_idx ON audit_logs(org_id, created_at)",
+  "CREATE INDEX IF NOT EXISTS attachments_org_style_idx ON attachments(org_id, style_id)",
+];
 
-  await binding.batch([
-    binding.prepare("INSERT INTO sample_orders (order_no, customer, merchandiser, due_date, priority, sample_type, status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind("YP-260728-001", "Morrow Studio", "林雪", "2026-07-30", "紧急", "确认样", "生产中"),
-    binding.prepare("INSERT INTO sample_orders (order_no, customer, merchandiser, due_date, priority, sample_type, status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind("YP-260728-002", "Nordlicht", "陈璐", "2026-08-02", "普通", "开发样", "生产中"),
-    binding.prepare("INSERT INTO sample_orders (order_no, customer, merchandiser, due_date, priority, sample_type, status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind("YP-260727-009", "Parallel Goods", "林雪", "2026-07-29", "普通", "销售样", "异常"),
-  ]);
+const tenantTables = [
+  "sample_orders",
+  "styles",
+  "process_tasks",
+  "change_records",
+  "notifications",
+  "audit_logs",
+  "attachments",
+] as const;
 
-  const orderRows = await binding.prepare("SELECT id, order_no FROM sample_orders ORDER BY id").all<{ id: number; order_no: string }>();
-  const orderMap = new Map(orderRows.results.map((row) => [row.order_no, row.id]));
-  await binding.batch([
-    binding.prepare("INSERT INTO styles (order_id, style_no, color, size, quantity, version, main_image, status, current_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(orderMap.get("YP-260728-001"), "SL-081", "雾灰", "39", 2, 2, "mint", "生产中", "针车"),
-    binding.prepare("INSERT INTO styles (order_id, style_no, color, size, quantity, version, main_image, status, current_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(orderMap.get("YP-260728-001"), "SL-081", "奶油白", "38", 1, 1, "sand", "生产中", "切割"),
-    binding.prepare("INSERT INTO styles (order_id, style_no, color, size, quantity, version, main_image, status, current_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(orderMap.get("YP-260728-002"), "MT-220", "深海蓝", "42", 2, 1, "navy", "生产中", "备料"),
-    binding.prepare("INSERT INTO styles (order_id, style_no, color, size, quantity, version, main_image, status, current_process) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(orderMap.get("YP-260727-009"), "WK-104", "栗棕", "40", 1, 1, "clay", "异常", "加工"),
-  ]);
+export async function ensureDatabase(corpId: string, orgName: string): Promise<Organization> {
+  const targetCorpId = corpId.trim();
+  if (!targetCorpId) throw new Error("缺少目标钉钉组织 CorpId");
+  if (!schemaPromise) {
+    schemaPromise = prepareSchema().catch((error) => {
+      schemaPromise = null;
+      throw error;
+    });
+  }
+  await schemaPromise;
 
-  const styleRows = await binding.prepare("SELECT id, style_no, color FROM styles ORDER BY id").all<{ id: number; style_no: string; color: string }>();
-  const style = (styleNo: string, color: string) => styleRows.results.find((row) => row.style_no === styleNo && row.color === color)!.id;
-  const taskRows: Array<[number, string, number, string, string]> = [
-    [style("SL-081", "雾灰"), "备料", 1, "周师傅", "已完成"],
-    [style("SL-081", "雾灰"), "开版", 1, "李师傅", "已完成"],
-    [style("SL-081", "雾灰"), "切割", 2, "王师傅", "已完成"],
-    [style("SL-081", "雾灰"), "加工", 3, "赵师傅", "已完成"],
-    [style("SL-081", "雾灰"), "针车", 4, "孙师傅", "进行中"],
-    [style("SL-081", "雾灰"), "成型", 5, "钱师傅", "等待前置工序"],
-    [style("SL-081", "奶油白"), "备料", 1, "周师傅", "已完成"],
-    [style("SL-081", "奶油白"), "开版", 1, "李师傅", "已完成"],
-    [style("SL-081", "奶油白"), "切割", 2, "王师傅", "待开始"],
-    [style("SL-081", "奶油白"), "加工", 3, "赵师傅", "等待前置工序"],
-    [style("SL-081", "奶油白"), "针车", 4, "孙师傅", "等待前置工序"],
-    [style("SL-081", "奶油白"), "成型", 5, "钱师傅", "等待前置工序"],
-    [style("MT-220", "深海蓝"), "备料", 1, "周师傅", "进行中"],
-    [style("MT-220", "深海蓝"), "开版", 1, "李师傅", "待开始"],
-    [style("MT-220", "深海蓝"), "切割", 2, "王师傅", "等待前置工序"],
-    [style("MT-220", "深海蓝"), "加工", 3, "赵师傅", "等待前置工序"],
-    [style("MT-220", "深海蓝"), "针车", 4, "孙师傅", "等待前置工序"],
-    [style("MT-220", "深海蓝"), "成型", 5, "钱师傅", "等待前置工序"],
-    [style("WK-104", "栗棕"), "备料", 1, "周师傅", "已完成"],
-    [style("WK-104", "栗棕"), "开版", 1, "李师傅", "已完成"],
-    [style("WK-104", "栗棕"), "切割", 2, "王师傅", "已完成"],
-    [style("WK-104", "栗棕"), "加工", 3, "赵师傅", "异常"],
-    [style("WK-104", "栗棕"), "针车", 4, "孙师傅", "等待前置工序"],
-    [style("WK-104", "栗棕"), "成型", 5, "钱师傅", "等待前置工序"],
-  ];
-  await binding.batch(taskRows.map((row) =>
-    binding.prepare("INSERT INTO process_tasks (style_id, process, sequence, assignee, status, planned_start, planned_end) VALUES (?, ?, ?, ?, ?, ?, ?)")
-      .bind(...row, "2026-07-28 08:00", "2026-07-29 18:00")
+  const database = db();
+  const now = new Date().toISOString();
+  await database.prepare(`INSERT INTO organizations (corp_id, name, active, updated_at)
+    VALUES (?, ?, 1, ?)
+    ON CONFLICT(corp_id) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at`)
+    .bind(targetCorpId, orgName.trim() || targetCorpId, now).run();
+  const org = await database.prepare("SELECT id, corp_id, name FROM organizations WHERE corp_id = ? AND active = 1")
+    .bind(targetCorpId)
+    .first<{ id: number; corp_id: string; name: string }>();
+  if (!org) throw new Error("目标组织初始化失败");
+
+  // Existing single-organization MVP rows are safely claimed by the configured target org.
+  await database.batch(tenantTables.map((table) =>
+    database.prepare(`UPDATE ${table} SET org_id = ? WHERE org_id IS NULL`).bind(org.id)
   ));
-  await binding.batch([
-    binding.prepare("INSERT INTO change_records (style_id, from_version, to_version, reason, content, applicant, status) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(style("SL-081", "雾灰"), 1, 2, "客户要求", "鞋带孔位置上移 3mm；主效果图已更新。", "林雪", "待主管处理"),
-    binding.prepare("INSERT INTO notifications (recipient, title, body, channel, status) VALUES (?, ?, ?, ?, ?)").bind("赵主管", "客户变更待评估", "SL-081 雾灰已更新至 V2，请评估影响。", "系统内（钉钉待联调）", "待处理"),
-    binding.prepare("INSERT INTO audit_logs (entity_type, entity_id, action, after_value, actor) VALUES (?, ?, ?, ?, ?)").bind("样品款式", style("SL-081", "雾灰"), "提交客户变更", "V1 → V2", "林雪"),
-  ]);
+
+  return { id: org.id, corpId: org.corp_id, name: org.name };
+}
+
+async function prepareSchema(): Promise<void> {
+  const database = db();
+  await database.batch(schemaStatements.map((statement) => database.prepare(statement)));
+
+  // D1/SQLite does not support ADD COLUMN IF NOT EXISTS consistently, so inspect first.
+  await ensureColumn("sample_orders", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("styles", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("process_tasks", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("process_tasks", "assignee_user_id", "INTEGER REFERENCES users(id)");
+  await ensureColumn("change_records", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("notifications", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("audit_logs", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("audit_logs", "actor_user_id", "INTEGER REFERENCES users(id)");
+  await ensureColumn("attachments", "org_id", "INTEGER REFERENCES organizations(id)");
+  await ensureColumn("attachments", "uploaded_by_user_id", "INTEGER REFERENCES users(id)");
+
+  await database.batch(indexes.map((statement) => database.prepare(statement)));
+}
+
+async function ensureColumn(table: string, column: string, declaration: string): Promise<void> {
+  const columns = await db().prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
+  if (columns.results.some((item) => item.name === column)) return;
+  await db().prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`).run();
 }
 
 export function binding() {

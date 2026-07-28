@@ -1,11 +1,19 @@
 import { env } from "cloudflare:workers";
-import { binding, ensureDatabase } from "../../../lib/data";
+import {
+  assertSameOrigin,
+  errorResponse,
+  RequestError,
+  requireUser,
+} from "../../../lib/auth";
+import { isSupervisor } from "../../../lib/authorization";
+import { binding } from "../../../lib/data";
 
 type StorageEnv = { ATTACHMENTS: R2Bucket };
 
 export async function POST(request: Request) {
   try {
-    await ensureDatabase();
+    assertSameOrigin(request);
+    const user = await requireUser(request, "attachment:self");
     const form = await request.formData();
     const file = form.get("file");
     const styleId = Number(form.get("styleId"));
@@ -16,16 +24,48 @@ export async function POST(request: Request) {
     if (file.size > 15 * 1024 * 1024) {
       return Response.json({ error: "单个附件不能超过 15MB" }, { status: 413 });
     }
+    const db = binding();
+    const style = await db.prepare("SELECT id, version FROM styles WHERE id = ? AND org_id = ?")
+      .bind(styleId, user.orgId)
+      .first<{ id: number; version: number }>();
+    if (!style) return Response.json({ error: "目标款式不存在" }, { status: 404 });
+    if (version !== style.version) {
+      return Response.json({ error: "附件版本与当前款式版本不一致" }, { status: 409 });
+    }
+
+    if (!isSupervisor(user.role)) {
+      const assignment = await db.prepare(`SELECT id FROM process_tasks
+        WHERE org_id = ? AND style_id = ?
+        AND assignee_user_id = ?
+        LIMIT 1`)
+        .bind(user.orgId, styleId, user.id).first();
+      if (!assignment) {
+        throw new RequestError("你只能给自己参与的款式上传附件", 403, "RESOURCE_FORBIDDEN");
+      }
+    }
+
     const bucket = (env as unknown as StorageEnv).ATTACHMENTS;
     if (!bucket) throw new Error("附件存储尚未绑定");
-    const key = `styles/${styleId}/v${version}/${crypto.randomUUID()}-${file.name}`;
-    await bucket.put(key, file.stream(), { httpMetadata: { contentType: file.type || "application/octet-stream" } });
-    await binding().prepare(`INSERT INTO attachments
-      (style_id, version, object_key, file_name, content_type, uploaded_by)
-      VALUES (?, ?, ?, ?, ?, ?)`)
-      .bind(styleId, version, key, file.name, file.type || "application/octet-stream", "当前用户").run();
+    const safeName = file.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(-120) || "attachment";
+    const key = `orgs/${user.orgId}/styles/${styleId}/v${version}/${crypto.randomUUID()}-${safeName}`;
+    await bucket.put(key, file.stream(), {
+      httpMetadata: { contentType: file.type || "application/octet-stream" },
+    });
+    await db.prepare(`INSERT INTO attachments
+      (org_id, style_id, version, object_key, file_name, content_type, uploaded_by, uploaded_by_user_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(
+        user.orgId,
+        styleId,
+        version,
+        key,
+        file.name,
+        file.type || "application/octet-stream",
+        user.name,
+        user.id,
+      ).run();
     return Response.json({ ok: true, fileName: file.name }, { status: 201 });
   } catch (error) {
-    return Response.json({ error: error instanceof Error ? error.message : "附件上传失败" }, { status: 500 });
+    return errorResponse(error, "附件上传失败");
   }
 }

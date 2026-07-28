@@ -18,13 +18,13 @@ export async function generateMetadata(): Promise<Metadata> {
       title,
       description,
       type: "website",
-      images: [{ url: `${origin}/og.png`, width: 1200, height: 630, alt: "样品流流程管理平台" }],
+      images: [{ url: `${origin}/og-v2.png`, width: 1536, height: 1024, alt: "SampleFlow 样品室流程平台" }],
     },
     twitter: {
       card: "summary_large_image",
       title,
       description,
-      images: [`${origin}/og.png`],
+      images: [`${origin}/og-v2.png`],
     },
   };
 }

@@ -2,6 +2,16 @@
 
 import { FormEvent, useCallback, useEffect, useMemo, useState } from "react";
 
+type AppRole = "member" | "supervisor" | "admin";
+type AuthUser = {
+  id: number;
+  orgId: number;
+  corpId: string;
+  dingtalkUserId: string;
+  name: string;
+  avatar: string | null;
+  role: AppRole;
+};
 type Order = {
   id: number; order_no: string; customer: string; merchandiser: string;
   due_date: string; priority: string; sample_type: string; status: string;
@@ -13,6 +23,7 @@ type Style = {
 };
 type Task = {
   id: number; style_id: number; process: string; assignee: string; status: string;
+  assignee_user_id?: number | null;
   row_version: number; order_no: string; style_no: string; color: string; customer: string;
   due_date: string; priority: string; main_image: string; exception_note?: string;
 };
@@ -27,13 +38,47 @@ type Audit = {
 };
 type Notice = { id: number; title: string; body: string; status: string; created_at: string };
 type Attachment = { id: number; style_id: number; version: number; file_name: string; created_at: string };
+type OrgMember = {
+  id: number;
+  name: string;
+  avatar: string | null;
+  role: AppRole;
+  dingtalk_user_id: string;
+};
 type DashboardData = {
+  viewer?: AuthUser;
   orders: Order[]; styles: Style[]; tasks: Task[]; changes: Change[];
-  notifications: Notice[]; audits: Audit[]; attachments: Attachment[];
+  notifications: Notice[]; audits: Audit[]; attachments: Attachment[]; members: OrgMember[];
 };
 
+type DingTalkClient = {
+  ready(callback: () => void): void;
+  error(callback: (error: unknown) => void): void;
+  env?: { platform?: string };
+  runtime: {
+    permission: {
+      requestAuthCode(options: {
+        corpId: string;
+        onSuccess(result: { code: string }): void;
+        onFail(error: unknown): void;
+      }): void;
+    };
+  };
+  biz?: {
+    navigation?: {
+      setTitle(options: { title: string }): void;
+    };
+  };
+};
+
+declare global {
+  interface Window {
+    dd?: DingTalkClient;
+  }
+}
+
 const emptyData: DashboardData = {
-  orders: [], styles: [], tasks: [], changes: [], notifications: [], audits: [], attachments: [],
+  orders: [], styles: [], tasks: [], changes: [], notifications: [], audits: [], attachments: [], members: [],
 };
 
 const nav = [
@@ -42,8 +87,104 @@ const nav = [
   { key: "tasks", label: "我的任务", short: "任" },
   { key: "changes", label: "变更追溯", short: "变" },
 ];
+const navKeys = new Set(nav.map((item) => item.key));
 
 const processNames = ["备料", "开版", "切割", "加工", "针车", "成型"];
+const DINGTALK_SCRIPT_ID = "dingtalk-jsapi";
+const DINGTALK_SCRIPT_URL = "https://g.alicdn.com/dingding/dingtalk-jsapi/3.1.5/dingtalk.open.js";
+
+async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
+  const method = (init?.method || "GET").toUpperCase();
+  const headers = new Headers(init?.headers);
+  if (method !== "GET" && method !== "HEAD") {
+    headers.set("x-sampleflow-request", "1");
+  }
+  const response = await fetch(input, { ...init, headers });
+  if (response.status === 401 && typeof window !== "undefined") {
+    window.dispatchEvent(new Event("sampleflow:unauthorized"));
+  }
+  return response;
+}
+
+function isDingTalkClient() {
+  return typeof navigator !== "undefined" && /DingTalk|AliApp\(DingTalk/i.test(navigator.userAgent);
+}
+
+async function loadDingTalkClient(): Promise<DingTalkClient> {
+  if (window.dd) return window.dd;
+  await new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const existing = document.getElementById(DINGTALK_SCRIPT_ID) as HTMLScriptElement | null;
+    // A failed or timed-out element will never fire load again. Replace it on every retry.
+    existing?.remove();
+    const script = document.createElement("script");
+    const finish = (error?: Error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      script.removeEventListener("load", loaded);
+      script.removeEventListener("error", failed);
+      if (error) {
+        script.remove();
+        reject(error);
+      }
+      else resolve();
+    };
+    const loaded = () => finish();
+    const failed = () => finish(new Error("钉钉组件加载失败"));
+    const timer = window.setTimeout(
+      () => finish(new Error("钉钉组件加载超时，请检查网络后重试")),
+      10_000,
+    );
+    script.addEventListener("load", loaded);
+    script.addEventListener("error", failed);
+    script.id = DINGTALK_SCRIPT_ID;
+    script.src = DINGTALK_SCRIPT_URL;
+    script.async = true;
+    document.head.appendChild(script);
+  });
+  if (!window.dd) throw new Error("当前环境未提供钉钉客户端能力");
+  return window.dd;
+}
+
+async function requestDingTalkCode(client: DingTalkClient, corpId: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = window.setTimeout(
+      () => fail(new Error("钉钉授权响应超时，请重新打开应用")),
+      10_000,
+    );
+    const fail = (error: unknown) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error(dingTalkErrorMessage(error)));
+    };
+    client.error(fail);
+    client.ready(() => {
+      client.biz?.navigation?.setTitle({ title: "SampleFlow 样品室" });
+      client.runtime.permission.requestAuthCode({
+        corpId,
+        onSuccess: ({ code }) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          resolve(code);
+        },
+        onFail: fail,
+      });
+    });
+  });
+}
+
+function dingTalkErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object") {
+    const value = error as { errorMessage?: string; errmsg?: string; message?: string };
+    return value.errorMessage || value.errmsg || value.message || "钉钉免登授权失败";
+  }
+  return "钉钉免登授权失败";
+}
 
 function dateLabel(value: string) {
   const date = new Date(value);
@@ -61,6 +202,9 @@ function statusClass(status: string) {
 
 export default function MesApp() {
   const [data, setData] = useState<DashboardData>(emptyData);
+  const [viewer, setViewer] = useState<AuthUser | null>(null);
+  const [authState, setAuthState] = useState<"checking" | "ready" | "error">("checking");
+  const [authError, setAuthError] = useState("");
   const [active, setActive] = useState("overview");
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
@@ -71,9 +215,57 @@ export default function MesApp() {
   const [selectedStyle, setSelectedStyle] = useState<Style | null>(null);
   const [acting, setActing] = useState<number | null>(null);
 
+  const authenticate = useCallback(async () => {
+    setAuthState("checking");
+    setLoading(true);
+    setAuthError("");
+    try {
+      const currentResponse = await fetch("/api/auth/me", { cache: "no-store" });
+      if (currentResponse.ok) {
+        const current = await currentResponse.json() as { user: AuthUser };
+        setViewer(current.user);
+        setAuthState("ready");
+        return;
+      }
+      if (currentResponse.status !== 401) {
+        const current = await currentResponse.json() as { error?: string };
+        throw new Error(current.error || "无法读取登录状态");
+      }
+      if (!isDingTalkClient()) {
+        throw new Error("请从钉钉工作台打开 SampleFlow 样品室");
+      }
+
+      const configResponse = await fetch("/api/auth/config", { cache: "no-store" });
+      const config = await configResponse.json() as { corpId?: string; error?: string };
+      if (!configResponse.ok || !config.corpId) {
+        throw new Error(config.error || "钉钉应用尚未完成配置");
+      }
+      const client = await loadDingTalkClient();
+      const code = await requestDingTalkCode(client, config.corpId);
+      const loginResponse = await apiFetch("/api/auth/dingtalk", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-sampleflow-request": "1",
+        },
+        body: JSON.stringify({ code }),
+      });
+      const login = await loginResponse.json() as { user?: AuthUser; error?: string };
+      if (!loginResponse.ok || !login.user) {
+        throw new Error(login.error || "钉钉免登失败");
+      }
+      setViewer(login.user);
+      setAuthState("ready");
+    } catch (error) {
+      setViewer(null);
+      setAuthState("error");
+      setAuthError(error instanceof Error ? error.message : "钉钉免登失败");
+    }
+  }, []);
+
   const load = useCallback(async () => {
     try {
-      const response = await fetch("/api/dashboard", { cache: "no-store" });
+      const response = await apiFetch("/api/dashboard", { cache: "no-store" });
       const result = await response.json() as DashboardData & { error?: string };
       if (!response.ok) throw new Error(result.error || "加载失败");
       setData(result);
@@ -84,17 +276,59 @@ export default function MesApp() {
     }
   }, []);
 
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void authenticate(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [authenticate]);
+  useEffect(() => {
+    const reauthenticate = () => {
+      setViewer(null);
+      void authenticate();
+    };
+    window.addEventListener("sampleflow:unauthorized", reauthenticate);
+    return () => window.removeEventListener("sampleflow:unauthorized", reauthenticate);
+  }, [authenticate]);
+  useEffect(() => {
+    if (authState !== "ready" || !viewer) return;
+    const timer = window.setTimeout(() => { void load(); }, 0);
+    return () => window.clearTimeout(timer);
+  }, [authState, load, viewer]);
+  useEffect(() => {
+    const syncNavigation = () => {
+      const key = window.location.hash.replace(/^#\/?/u, "");
+      setActive(navKeys.has(key) ? key : "overview");
+      setOrderModal(false);
+      setChangeModal(false);
+      setSelectedStyle(null);
+    };
+    syncNavigation();
+    window.addEventListener("hashchange", syncNavigation);
+    return () => window.removeEventListener("hashchange", syncNavigation);
+  }, []);
+
+  const navigateTo = useCallback((key: string) => {
+    if (!navKeys.has(key)) return;
+    const nextHash = `#/${key}`;
+    if (window.location.hash === nextHash) setActive(key);
+    else window.location.hash = nextHash;
+  }, []);
 
   const openTasks = useMemo(
     () => data.tasks.filter((task) => ["待开始", "进行中", "暂停", "异常"].includes(task.status)),
     [data.tasks],
   );
-  const visibleTasks = useMemo(() => openTasks.filter((task) => {
+  const actionableTasks = useMemo(
+    () => openTasks.filter((task) => {
+      if (!viewer || viewer.role !== "member") return true;
+      return task.assignee_user_id != null && task.assignee_user_id === viewer.id;
+    }),
+    [openTasks, viewer],
+  );
+  const visibleTasks = useMemo(() => actionableTasks.filter((task) => {
     if (taskFilter !== "全部" && task.status !== taskFilter && !(taskFilter === "加急" && task.priority === "紧急")) return false;
     const term = search.trim().toLowerCase();
     return !term || `${task.order_no}${task.style_no}${task.color}${task.assignee}`.toLowerCase().includes(term);
-  }), [openTasks, search, taskFilter]);
+  }), [actionableTasks, search, taskFilter]);
   const riskCount = data.tasks.filter((task) => ["异常", "暂停"].includes(task.status)).length;
   const completion = data.tasks.length
     ? Math.round(data.tasks.filter((task) => task.status === "已完成").length / data.tasks.length * 100)
@@ -104,13 +338,12 @@ export default function MesApp() {
     setActing(task.id);
     setMessage("");
     try {
-      const response = await fetch(`/api/tasks/${task.id}/action`, {
+      const response = await apiFetch(`/api/tasks/${task.id}/action`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           action,
           reason,
-          actor: task.assignee,
           rowVersion: task.row_version,
           idempotencyKey: `${task.id}-${action}-${crypto.randomUUID()}`,
         }),
@@ -126,9 +359,46 @@ export default function MesApp() {
     }
   }
 
+  async function assignTask(task: Task, userId: number) {
+    setActing(task.id);
+    setMessage("");
+    try {
+      const response = await apiFetch(`/api/tasks/${task.id}/assign`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          userId,
+          rowVersion: task.row_version,
+        }),
+      });
+      const result = await response.json() as { error?: string; assignee?: { name: string } };
+      if (!response.ok) throw new Error(result.error || "任务分配失败");
+      setMessage(`任务已分配给 ${result.assignee?.name || "所选成员"}`);
+      await load();
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "任务分配失败");
+    } finally {
+      setActing(null);
+    }
+  }
+
   function styleTasks(styleId: number) {
     return data.tasks.filter((task) => task.style_id === styleId);
   }
+
+  if (authState !== "ready" || !viewer) {
+    return (
+      <AuthGate
+        state={authState}
+        message={authError}
+        retry={() => { void authenticate(); }}
+      />
+    );
+  }
+
+  const canManage = viewer.role === "supervisor" || viewer.role === "admin";
+  const roleName = viewer.role === "admin" ? "管理员" : viewer.role === "supervisor" ? "主管" : "成员";
+  const initials = viewer.name.slice(0, 1);
 
   return (
     <main className="app-shell">
@@ -139,15 +409,15 @@ export default function MesApp() {
         </div>
         <nav>
           {nav.map((item) => (
-            <button key={item.key} className={active === item.key ? "nav-item selected" : "nav-item"} onClick={() => setActive(item.key)}>
+            <button key={item.key} className={active === item.key ? "nav-item selected" : "nav-item"} onClick={() => navigateTo(item.key)}>
               <span className="nav-icon">{item.short}</span>{item.label}
-              {item.key === "tasks" && openTasks.length > 0 && <b>{openTasks.length}</b>}
+              {item.key === "tasks" && actionableTasks.length > 0 && <b>{actionableTasks.length}</b>}
             </button>
           ))}
         </nav>
         <div className="sidebar-foot">
           <span className="sync-dot" />钉钉组织已连接
-          <small>系统内通知兜底已启用</small>
+          <small>{viewer.name} · {roleName}</small>
         </div>
       </aside>
 
@@ -162,10 +432,19 @@ export default function MesApp() {
               <span>⌕</span>
               <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="搜索单号、款号或人员" />
             </label>
-            <button className="notice-button" aria-label="消息中心" onClick={() => setActive("changes")}>
+            <button className="notice-button" aria-label="消息中心" onClick={() => navigateTo("changes")}>
               通知 <b>{data.notifications.filter((notice) => notice.status !== "已处理").length}</b>
             </button>
-            <div className="avatar">赵</div>
+            <div className="viewer-chip" title={`${viewer.name} · ${roleName}`}>
+              {viewer.avatar
+                ? <>
+                  {/* DingTalk avatar URLs are dynamic and cannot be preconfigured for image optimization. */}
+                  {/* eslint-disable-next-line @next/next/no-img-element */}
+                  <img className="avatar" src={viewer.avatar} alt="" referrerPolicy="no-referrer" />
+                </>
+                : <div className="avatar">{initials}</div>}
+              <span>{viewer.name}<small>{roleName}</small></span>
+            </div>
           </div>
         </header>
 
@@ -179,21 +458,35 @@ export default function MesApp() {
                   data={data}
                   completion={completion}
                   riskCount={riskCount}
-                  openTasks={openTasks}
+                  openTasks={actionableTasks}
                   onCreate={() => setOrderModal(true)}
+                  canManage={canManage}
+                  viewerName={viewer.name}
+                  members={data.members}
+                  canAssign={canManage}
+                  onAssign={assignTask}
                   onTaskAction={taskAction}
                   acting={acting}
                   onOpenStyle={(style) => setSelectedStyle(style)}
                 />
               )}
               {active === "orders" && (
-                <Orders data={data} search={search} onCreate={() => setOrderModal(true)} onOpenStyle={setSelectedStyle} />
+                <Orders data={data} search={search} canManage={canManage} onCreate={() => setOrderModal(true)} onOpenStyle={setSelectedStyle} />
               )}
               {active === "tasks" && (
-                <Tasks tasks={visibleTasks} filter={taskFilter} setFilter={setTaskFilter} action={taskAction} acting={acting} />
+                <Tasks
+                  tasks={visibleTasks}
+                  members={data.members}
+                  canAssign={canManage}
+                  filter={taskFilter}
+                  setFilter={setTaskFilter}
+                  action={taskAction}
+                  assign={assignTask}
+                  acting={acting}
+                />
               )}
               {active === "changes" && (
-                <Changes data={data} onCreate={() => setChangeModal(true)} />
+                <Changes data={data} canManage={canManage} onCreate={() => setChangeModal(true)} />
               )}
             </>
           )}
@@ -202,14 +495,14 @@ export default function MesApp() {
 
       <div className="mobile-nav">
         {nav.map((item) => (
-          <button key={item.key} className={active === item.key ? "selected" : ""} onClick={() => setActive(item.key)}>
+          <button key={item.key} className={active === item.key ? "selected" : ""} onClick={() => navigateTo(item.key)}>
             <span>{item.short}</span>{item.label.replace("工作", "").replace("我的", "").replace("追溯", "")}
           </button>
         ))}
       </div>
 
-      {orderModal && <OrderModal close={() => setOrderModal(false)} done={async (text) => { setMessage(text); setOrderModal(false); await load(); }} />}
-      {changeModal && <ChangeModal styles={data.styles} close={() => setChangeModal(false)} done={async (text) => { setMessage(text); setChangeModal(false); await load(); }} />}
+      {orderModal && canManage && <OrderModal viewerName={viewer.name} close={() => setOrderModal(false)} done={async (text) => { setMessage(text); setOrderModal(false); await load(); }} />}
+      {changeModal && canManage && <ChangeModal viewerName={viewer.name} styles={data.styles} close={() => setChangeModal(false)} done={async (text) => { setMessage(text); setChangeModal(false); await load(); }} />}
       {selectedStyle && (
         <StyleDrawer
           style={selectedStyle}
@@ -223,15 +516,47 @@ export default function MesApp() {
   );
 }
 
+function AuthGate({
+  state,
+  message,
+  retry,
+}: {
+  state: "checking" | "ready" | "error";
+  message: string;
+  retry: () => void;
+}) {
+  return (
+    <main className="auth-gate">
+      <section className="auth-card">
+        <div className="auth-logo">样</div>
+        <span className="section-tag">SampleFlow</span>
+        <h1>{state === "checking" ? "正在连接钉钉组织" : "暂时无法进入样品室"}</h1>
+        <p>
+          {state === "checking"
+            ? "正在确认你的组织成员身份和工作权限…"
+            : message || "请从钉钉工作台重新打开应用。"}
+        </p>
+        {state === "checking"
+          ? <div className="auth-progress"><i /></div>
+          : <button className="primary" onClick={retry}>重新验证</button>}
+        <small>企业内部应用 · 登录状态由钉钉组织统一管理</small>
+      </section>
+    </main>
+  );
+}
+
 function Loading() {
   return <div className="loading-grid">{[1, 2, 3, 4, 5, 6].map((item) => <div className="loading-card" key={item} />)}</div>;
 }
 
 function Overview({
-  data, completion, riskCount, openTasks, onCreate, onTaskAction, acting, onOpenStyle,
+  data, completion, riskCount, openTasks, onCreate, canManage, viewerName,
+  members, canAssign, onAssign, onTaskAction, acting, onOpenStyle,
 }: {
   data: DashboardData; completion: number; riskCount: number; openTasks: Task[];
-  onCreate: () => void; onTaskAction: (task: Task, action: string, reason?: string) => void;
+  onCreate: () => void; canManage: boolean; viewerName: string;
+  members: OrgMember[]; canAssign: boolean; onAssign: (task: Task, userId: number) => void;
+  onTaskAction: (task: Task, action: string, reason?: string) => void;
   acting: number | null; onOpenStyle: (style: Style) => void;
 }) {
   const statusCards = [
@@ -246,10 +571,10 @@ function Overview({
       <section className="hero-strip">
         <div>
           <span className="hero-kicker">7 月 28 日 · 周二</span>
-          <h2>早上好，赵主管</h2>
+          <h2>你好，{viewerName}</h2>
           <p>今天有 <strong>{openTasks.length}</strong> 个在办任务，<strong>{riskCount}</strong> 个风险项需要关注。</p>
         </div>
-        <button className="primary" onClick={onCreate}><span>＋</span> 新建样品单</button>
+        {canManage && <button className="primary" onClick={onCreate}><span>＋</span> 新建样品单</button>}
       </section>
 
       <section className="metric-grid">
@@ -267,7 +592,17 @@ function Overview({
             <button className="text-button">查看全部 →</button>
           </div>
           <div className="task-list">
-            {currentTasks.map((task) => <TaskRow key={task.id} task={task} action={onTaskAction} acting={acting} />)}
+            {currentTasks.map((task) => (
+              <TaskRow
+                key={task.id}
+                task={task}
+                members={members}
+                canAssign={canAssign}
+                action={onTaskAction}
+                assign={onAssign}
+                acting={acting}
+              />
+            ))}
           </div>
         </div>
         <div className="panel process-panel">
@@ -307,7 +642,14 @@ function Overview({
   );
 }
 
-function TaskRow({ task, action, acting }: { task: Task; action: (task: Task, action: string, reason?: string) => void; acting: number | null }) {
+function TaskRow({ task, members, canAssign, action, assign, acting }: {
+  task: Task;
+  members: OrgMember[];
+  canAssign: boolean;
+  action: (task: Task, action: string, reason?: string) => void;
+  assign: (task: Task, userId: number) => void;
+  acting: number | null;
+}) {
   const disabled = acting === task.id;
   return (
     <article className="task-row">
@@ -322,6 +664,27 @@ function TaskRow({ task, action, acting }: { task: Task; action: (task: Task, ac
       </div>
       <div className="deadline"><span>交期</span><strong>{dateLabel(task.due_date)}</strong></div>
       <div className="task-actions">
+        {canAssign && (
+          <label className="assign-control">
+            <span>分配给</span>
+            <select
+              aria-label={`将 ${task.style_no} ${task.process} 分配给`}
+              value={task.assignee_user_id ?? ""}
+              disabled={disabled || members.length === 0}
+              onChange={(event) => {
+                const userId = Number(event.target.value);
+                if (userId) assign(task, userId);
+              }}
+            >
+              <option value="" disabled>{members.length ? "选择组织成员" : "暂无可分配成员"}</option>
+              {members.map((member) => (
+                <option key={member.id} value={member.id}>
+                  {member.name} · {member.role === "admin" ? "管理员" : member.role === "supervisor" ? "主管" : "成员"}
+                </option>
+              ))}
+            </select>
+          </label>
+        )}
         {task.status === "待开始" && <button disabled={disabled} className="small primary" onClick={() => action(task, "start")}>开始</button>}
         {task.status === "进行中" && <>
           <button disabled={disabled} className="small secondary" onClick={() => action(task, "pause", "等待现场确认")}>暂停</button>
@@ -349,13 +712,19 @@ function StyleCard({ style, order, onClick }: { style: Style; order?: Order; onC
   );
 }
 
-function Orders({ data, search, onCreate, onOpenStyle }: { data: DashboardData; search: string; onCreate: () => void; onOpenStyle: (style: Style) => void }) {
+function Orders({ data, search, canManage, onCreate, onOpenStyle }: {
+  data: DashboardData;
+  search: string;
+  canManage: boolean;
+  onCreate: () => void;
+  onOpenStyle: (style: Style) => void;
+}) {
   const orders = data.orders.filter((order) => !search || `${order.order_no}${order.customer}${order.merchandiser}`.toLowerCase().includes(search.toLowerCase()));
   return (
     <section className="panel page-panel">
       <div className="page-head">
         <div><span className="section-tag">全流程主数据</span><h2>样品单与款式</h2><p>按交期排序，款式是最小流转单位。</p></div>
-        <button className="primary" onClick={onCreate}>＋ 新建样品单</button>
+        {canManage && <button className="primary" onClick={onCreate}>＋ 新建样品单</button>}
       </div>
       <div className="order-table">
         <div className="order-table-head"><span>样品单 / 客户</span><span>跟单员</span><span>交期</span><span>款式进度</span><span>状态</span></div>
@@ -384,9 +753,12 @@ function Orders({ data, search, onCreate, onOpenStyle }: { data: DashboardData; 
   );
 }
 
-function Tasks({ tasks, filter, setFilter, action, acting }: {
+function Tasks({ tasks, members, canAssign, filter, setFilter, action, assign, acting }: {
   tasks: Task[]; filter: string; setFilter: (value: string) => void;
-  action: (task: Task, action: string, reason?: string) => void; acting: number | null;
+  members: OrgMember[]; canAssign: boolean;
+  action: (task: Task, action: string, reason?: string) => void;
+  assign: (task: Task, userId: number) => void;
+  acting: number | null;
 }) {
   return (
     <section className="panel page-panel">
@@ -398,20 +770,37 @@ function Tasks({ tasks, filter, setFilter, action, acting }: {
           <button key={item} className={filter === item ? "selected" : ""} onClick={() => setFilter(item)}>{item}</button>
         ))}
       </div>
+      {canAssign && (
+        <p className="assignment-hint">
+          {members.length
+            ? "分配列表仅包含已打开过本应用的组织成员；找不到成员时，请先让对方从钉钉工作台进入一次。"
+            : "暂无可分配成员，请先让组织成员从钉钉工作台进入一次应用。"}
+        </p>
+      )}
       <div className="task-list roomy">
-        {tasks.length ? tasks.map((task) => <TaskRow key={task.id} task={task} action={action} acting={acting} />) : <Empty text="当前筛选下没有任务" />}
+        {tasks.length ? tasks.map((task) => (
+          <TaskRow
+            key={task.id}
+            task={task}
+            members={members}
+            canAssign={canAssign}
+            action={action}
+            assign={assign}
+            acting={acting}
+          />
+        )) : <Empty text="当前筛选下没有任务" />}
       </div>
     </section>
   );
 }
 
-function Changes({ data, onCreate }: { data: DashboardData; onCreate: () => void }) {
+function Changes({ data, canManage, onCreate }: { data: DashboardData; canManage: boolean; onCreate: () => void }) {
   return (
     <section className="change-layout">
       <div className="panel page-panel">
         <div className="page-head">
           <div><span className="section-tag">版本不可覆盖</span><h2>客户变更</h2><p>变更独立留痕，旧版本永久保留。</p></div>
-          <button className="primary" onClick={onCreate}>＋ 提交变更</button>
+          {canManage && <button className="primary" onClick={onCreate}>＋ 提交变更</button>}
         </div>
         <div className="change-list">
           {data.changes.map((change) => (
@@ -442,14 +831,14 @@ function Changes({ data, onCreate }: { data: DashboardData; onCreate: () => void
   );
 }
 
-function OrderModal({ close, done }: { close: () => void; done: (message: string) => void }) {
+function OrderModal({ viewerName, close, done }: { viewerName: string; close: () => void; done: (message: string) => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaving(true); setError("");
     const body = Object.fromEntries(new FormData(event.currentTarget));
-    const response = await fetch("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...body, quantity: Number(body.quantity) }) });
+    const response = await apiFetch("/api/orders", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ ...body, quantity: Number(body.quantity) }) });
     const result = await response.json() as { error?: string; orderNo?: string };
     if (!response.ok) { setError(result.error || "创建失败"); setSaving(false); return; }
     done(`${result.orderNo} 已创建并生成固定工序任务`);
@@ -458,7 +847,7 @@ function OrderModal({ close, done }: { close: () => void; done: (message: string
     <Modal title="新建样品单" subtitle="MVP 将完成审单校验并直接按固定模板排单" close={close}>
       <form className="form-grid" onSubmit={submit}>
         <label><span>客户名称 *</span><input name="customer" required placeholder="例如：Morrow Studio" /></label>
-        <label><span>跟单员</span><input name="merchandiser" defaultValue="林雪" /></label>
+        <label><span>创建人</span><input value={viewerName} readOnly /></label>
         <label><span>要求完成日期 *</span><input name="dueDate" type="date" required defaultValue="2026-08-05" /></label>
         <label><span>优先级</span><select name="priority"><option>普通</option><option>紧急</option></select></label>
         <div className="form-divider"><span>款式信息</span></div>
@@ -474,14 +863,14 @@ function OrderModal({ close, done }: { close: () => void; done: (message: string
   );
 }
 
-function ChangeModal({ styles, close, done }: { styles: Style[]; close: () => void; done: (message: string) => void }) {
+function ChangeModal({ viewerName, styles, close, done }: { viewerName: string; styles: Style[]; close: () => void; done: (message: string) => void }) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setSaving(true); setError("");
     const body = Object.fromEntries(new FormData(event.currentTarget));
-    const response = await fetch("/api/changes", {
+    const response = await apiFetch("/api/changes", {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ ...body, styleId: Number(body.styleId) }),
     });
@@ -495,7 +884,7 @@ function ChangeModal({ styles, close, done }: { styles: Style[]; close: () => vo
         <label><span>变更款式 *</span><select name="styleId" required>{styles.map((style) => <option key={style.id} value={style.id}>{style.style_no} · {style.color} · V{style.version}</option>)}</select></label>
         <label><span>变更原因</span><select name="reason"><option>客户要求</option><option>内部纠错</option><option>材料替代</option><option>其他</option></select></label>
         <label><span>变更内容 *</span><textarea name="content" required rows={5} placeholder="请清楚描述原要求与新要求…" /></label>
-        <label><span>申请人</span><input name="applicant" defaultValue="林雪" /></label>
+        <label><span>申请人</span><input value={viewerName} readOnly /></label>
         {error && <p className="form-error">{error}</p>}
         <div className="modal-actions"><button type="button" className="secondary" onClick={close}>取消</button><button className="primary" disabled={saving}>{saving ? "提交中…" : "提交变更"}</button></div>
       </form>
@@ -513,7 +902,7 @@ function StyleDrawer({ style, tasks, attachments, close, uploaded }: {
     setUploading(true);
     const form = new FormData();
     form.append("file", file); form.append("styleId", String(style.id)); form.append("version", String(style.version));
-    const response = await fetch("/api/attachments", { method: "POST", body: form });
+    const response = await apiFetch("/api/attachments", { method: "POST", body: form });
     setUploading(false);
     if (response.ok) await uploaded();
   }
