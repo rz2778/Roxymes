@@ -73,7 +73,7 @@ export function getDingTalkConfig() {
     appKey,
     appSecret,
     agentId: runtime.DINGTALK_AGENT_ID?.trim() || null,
-    orgName: runtime.DINGTALK_ORG_NAME?.trim() || "张子健是大帅哥",
+    orgName: runtime.DINGTALK_ORG_NAME?.trim() || "温州市金丽伦鞋业有限公司",
   };
 }
 
