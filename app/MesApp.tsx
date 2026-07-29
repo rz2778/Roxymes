@@ -91,7 +91,7 @@ const navKeys = new Set(nav.map((item) => item.key));
 
 const processNames = ["备料", "开版", "切割", "加工", "针车", "成型"];
 const DINGTALK_SCRIPT_ID = "dingtalk-jsapi";
-const DINGTALK_SCRIPT_URL = "https://g.alicdn.com/dingding/dingtalk-jsapi/3.1.5/dingtalk.open.js";
+const DINGTALK_SCRIPT_URL = "https://g.alicdn.com/dingding/dingtalk-jsapi/3.1.0/dingtalk.open.js";
 
 async function apiFetch(input: RequestInfo | URL, init?: RequestInit) {
   const method = (init?.method || "GET").toUpperCase();
