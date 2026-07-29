@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 
 export interface DingTalkMessage {
   recipient: string;
@@ -62,7 +61,7 @@ export class DingTalkError extends Error {
 }
 
 export function getDingTalkConfig() {
-  const runtime = env as unknown as DingTalkEnv;
+  const runtime = process.env as DingTalkEnv;
   const corpId = runtime.DINGTALK_CORP_ID?.trim();
   const appKey = runtime.DINGTALK_APP_KEY?.trim();
   const appSecret = runtime.DINGTALK_APP_SECRET?.trim();

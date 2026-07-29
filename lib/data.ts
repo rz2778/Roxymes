@@ -1,6 +1,23 @@
-import { env } from "cloudflare:workers";
+import { neon } from "@neondatabase/serverless";
 
-type D1Env = { DB: D1Database };
+type QueryResult<T = Record<string, unknown>> = {
+  results: T[];
+  meta: { changes?: number; last_row_id?: number | string };
+};
+
+export type DatabaseLike = {
+  prepare(query: string): {
+    run(): Promise<QueryResult>;
+    first<T>(): Promise<T | null>;
+    all<T>(): Promise<QueryResult<T>>;
+    bind(...values: unknown[]): {
+      run(): Promise<QueryResult>;
+      first<T>(): Promise<T | null>;
+      all<T>(): Promise<QueryResult<T>>;
+    };
+  };
+  batch(statements: unknown[]): Promise<QueryResult[]>;
+};
 
 export type Organization = {
   id: number;
@@ -9,10 +26,44 @@ export type Organization = {
 };
 
 let schemaPromise: Promise<void> | null = null;
+let database: DatabaseLike | null = null;
 
-function db() {
-  const database = (env as unknown as D1Env).DB;
-  if (!database) throw new Error("D1 数据库尚未绑定");
+type NeonResult = { rows?: Record<string, unknown>[]; rowCount?: number };
+
+function postgresQuery(query: string, values: unknown[]): Promise<NeonResult> {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) throw new Error("数据库尚未连接。请在 Vercel Marketplace 中添加 Neon Postgres 后配置 DATABASE_URL。");
+  const sql = neon(connectionString, { fullResults: true });
+  const postgresQuery = query
+    .replaceAll("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
+    .replaceAll("?", (_, index) => `$${index + 1}`);
+  return sql.query(postgresQuery, values) as Promise<NeonResult>;
+}
+
+class PostgresStatement {
+  constructor(private readonly query: string, private readonly values: unknown[] = []) {}
+  bind(...values: unknown[]) { return new PostgresStatement(this.query, values); }
+  async run(): Promise<QueryResult> {
+    const result = await postgresQuery(this.query, this.values);
+    const firstRow = result.rows?.[0] as { id?: number } | undefined;
+    return { results: result.rows || [], meta: { changes: result.rowCount || 0, last_row_id: firstRow?.id } };
+  }
+  async first<T>(): Promise<T | null> {
+    const result = await postgresQuery(this.query, this.values);
+    return (result.rows?.[0] as T | undefined) || null;
+  }
+  async all<T>(): Promise<QueryResult<T>> {
+    const result = await postgresQuery(this.query, this.values);
+    return { results: (result.rows || []) as T[], meta: { changes: result.rowCount || 0 } };
+  }
+}
+
+function db(): DatabaseLike {
+  if (database) return database;
+  database = {
+    prepare(query) { return new PostgresStatement(query); },
+    async batch(statements) { return Promise.all((statements as PostgresStatement[]).map((statement) => statement.run())); },
+  };
   return database;
 }
 
@@ -199,27 +250,9 @@ async function prepareSchema(): Promise<void> {
   const database = db();
   await database.batch(schemaStatements.map((statement) => database.prepare(statement)));
 
-  // D1/SQLite does not support ADD COLUMN IF NOT EXISTS consistently, so inspect first.
-  await ensureColumn("sample_orders", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("styles", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("process_tasks", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("process_tasks", "assignee_user_id", "INTEGER REFERENCES users(id)");
-  await ensureColumn("change_records", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("notifications", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("audit_logs", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("audit_logs", "actor_user_id", "INTEGER REFERENCES users(id)");
-  await ensureColumn("attachments", "org_id", "INTEGER REFERENCES organizations(id)");
-  await ensureColumn("attachments", "uploaded_by_user_id", "INTEGER REFERENCES users(id)");
-
   await database.batch(indexes.map((statement) => database.prepare(statement)));
 }
 
-async function ensureColumn(table: string, column: string, declaration: string): Promise<void> {
-  const columns = await db().prepare(`PRAGMA table_info(${table})`).all<{ name: string }>();
-  if (columns.results.some((item) => item.name === column)) return;
-  await db().prepare(`ALTER TABLE ${table} ADD COLUMN ${column} ${declaration}`).run();
-}
-
-export function binding() {
+export function binding(): DatabaseLike {
   return db();
 }

@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import {
   assertSameOrigin,
   errorResponse,
@@ -8,7 +7,6 @@ import {
 import { isSupervisor } from "../../../lib/authorization";
 import { binding } from "../../../lib/data";
 
-type StorageEnv = { ATTACHMENTS: R2Bucket };
 
 export async function POST(request: Request) {
   try {
@@ -21,7 +19,8 @@ export async function POST(request: Request) {
     if (!(file instanceof File) || !styleId) {
       return Response.json({ error: "请选择文件和目标款式" }, { status: 400 });
     }
-    if (file.size > 15 * 1024 * 1024) {
+    const uploadedFile = file;
+    if (uploadedFile.size > 15 * 1024 * 1024) {
       return Response.json({ error: "单个附件不能超过 15MB" }, { status: 413 });
     }
     const db = binding();
@@ -44,13 +43,10 @@ export async function POST(request: Request) {
       }
     }
 
-    const bucket = (env as unknown as StorageEnv).ATTACHMENTS;
-    if (!bucket) throw new Error("附件存储尚未绑定");
-    const safeName = file.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(-120) || "attachment";
+    if (!process.env.BLOB_READ_WRITE_TOKEN) throw new Error("附件存储尚未配置");
+    const safeName = uploadedFile.name.replace(/[^\p{L}\p{N}._-]+/gu, "_").slice(-120) || "attachment";
     const key = `orgs/${user.orgId}/styles/${styleId}/v${version}/${crypto.randomUUID()}-${safeName}`;
-    await bucket.put(key, file.stream(), {
-      httpMetadata: { contentType: file.type || "application/octet-stream" },
-    });
+    throw new Error("附件存储正在迁移至 Vercel Blob，暂不支持上传");
     await db.prepare(`INSERT INTO attachments
       (org_id, style_id, version, object_key, file_name, content_type, uploaded_by, uploaded_by_user_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
@@ -59,12 +55,12 @@ export async function POST(request: Request) {
         styleId,
         version,
         key,
-        file.name,
-        file.type || "application/octet-stream",
+        uploadedFile.name,
+        uploadedFile.type || "application/octet-stream",
         user.name,
         user.id,
       ).run();
-    return Response.json({ ok: true, fileName: file.name }, { status: 201 });
+    return Response.json({ ok: true, fileName: uploadedFile.name }, { status: 201 });
   } catch (error) {
     return errorResponse(error, "附件上传失败");
   }

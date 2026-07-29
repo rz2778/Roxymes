@@ -1,4 +1,3 @@
-import { env } from "cloudflare:workers";
 import { binding, ensureDatabase } from "./data";
 import type { DingTalkProfile } from "./dingtalk";
 import { getDingTalkConfig } from "./dingtalk";
@@ -202,7 +201,7 @@ export function errorResponse(error: unknown, fallback: string): Response {
 
 function resolveRole(profile: DingTalkProfile): AppRole {
   if (profile.admin) return "admin";
-  const runtime = env as unknown as AuthEnv;
+  const runtime = process.env as AuthEnv;
   const supervisors = new Set(
     (runtime.DINGTALK_SUPERVISOR_USER_IDS || "")
       .split(",")

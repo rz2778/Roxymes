@@ -34,7 +34,8 @@ export async function POST(request: Request) {
     const orderNo = `YP-${new Date().toISOString().slice(2, 10).replaceAll("-", "")}-${crypto.randomUUID().slice(0, 6).toUpperCase()}`;
     const orderResult = await db.prepare(`INSERT INTO sample_orders
       (org_id, order_no, customer, merchandiser, due_date, priority, sample_type, status)
-      VALUES (?, ?, ?, ?, ?, ?, '开发样', '生产中')`)
+      VALUES (?, ?, ?, ?, ?, ?, '开发样', '生产中')
+      RETURNING id`)
       .bind(
         user.orgId,
         orderNo,
@@ -46,7 +47,8 @@ export async function POST(request: Request) {
     const orderId = Number(orderResult.meta.last_row_id);
     const styleResult = await db.prepare(`INSERT INTO styles
       (org_id, order_id, style_no, color, size, quantity, version, main_image, status, current_process)
-      VALUES (?, ?, ?, ?, ?, ?, 1, 'mint', '生产中', '备料/开版')`)
+      VALUES (?, ?, ?, ?, ?, ?, 1, 'mint', '生产中', '备料/开版')
+      RETURNING id`)
       .bind(
         user.orgId,
         orderId,
