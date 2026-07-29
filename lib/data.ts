@@ -31,7 +31,10 @@ let database: DatabaseLike | null = null;
 type NeonResult = { rows?: Record<string, unknown>[]; rowCount?: number };
 
 function postgresQuery(query: string, values: unknown[]): Promise<NeonResult> {
-  const connectionString = process.env.DATABASE_URL;
+  const connectionString =
+    process.env.DATABASE_URL ||
+    process.env.POSTGRES_URL ||
+    process.env.POSTGRES_URL_NON_POOLING;
   if (!connectionString) throw new Error("数据库尚未连接。请在 Vercel Marketplace 中添加 Neon Postgres 后配置 DATABASE_URL。");
   const sql = neon(connectionString, { fullResults: true });
   let paramIndex = 0;
