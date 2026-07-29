@@ -34,9 +34,10 @@ function postgresQuery(query: string, values: unknown[]): Promise<NeonResult> {
   const connectionString = process.env.DATABASE_URL;
   if (!connectionString) throw new Error("数据库尚未连接。请在 Vercel Marketplace 中添加 Neon Postgres 后配置 DATABASE_URL。");
   const sql = neon(connectionString, { fullResults: true });
+  let paramIndex = 0;
   const postgresQuery = query
     .replaceAll("INTEGER PRIMARY KEY AUTOINCREMENT", "BIGSERIAL PRIMARY KEY")
-    .replaceAll("?", (_, index) => `$${index + 1}`);
+    .replace(/\?/g, () => `$${++paramIndex}`);
   return sql.query(postgresQuery, values) as Promise<NeonResult>;
 }
 
